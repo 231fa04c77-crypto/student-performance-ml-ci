@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+venv/
+student_performance_processed.csv
+student_performance_model.pkl
+metrics.json
+release_candidate/

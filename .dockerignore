@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.git/
+.github/
+test_*.py
+train_model.py
+quality_gate.py
+StudentsPerformance.csv
+student_performance_processed.csv
+release_candidate/
+venv/
