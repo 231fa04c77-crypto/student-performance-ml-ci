@@ -48,6 +48,18 @@ class TestPredictionApplication(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["prediction"], "FAIL")
 
+    def test_openapi_spec(self):
+        response = self.client.get("/openapi.json")
+        self.assertEqual(response.status_code, 200)
+        spec = response.get_json()
+        self.assertEqual(spec["openapi"], "3.0.3")
+        self.assertIn("/predict", spec["paths"])
+
+    def test_swagger_ui_page(self):
+        response = self.client.get("/docs")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"swagger-ui", response.data)
+
     def test_missing_field_validation(self):
         response = self.client.post("/predict", json={"gender": "female"})
         self.assertEqual(response.status_code, 400)
