@@ -1,0 +1,5 @@
+{
+    "accuracy": 0.94,
+    "training_records": 800,
+    "testing_records": 200
+}
