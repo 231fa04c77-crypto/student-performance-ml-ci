@@ -34,7 +34,7 @@ jobs:
       - name: Test API health endpoint
         run: |
           for attempt in {1..20}; do
-            if curl --fail --silent http://localhost:5000/; then
+            if curl --fail --silent http://localhost:5000/health; then
               echo "Health check passed."
               exit 0
             fi
