@@ -1,4 +1,3 @@
-
 from pathlib import Path
 import logging
 import time
@@ -6,7 +5,14 @@ import uuid
 
 import joblib
 import pandas as pd
-from flask import Flask, jsonify, request, g
+from flask import Flask, jsonify, request, Response, g
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 
 app = Flask(__name__)
 
@@ -37,13 +43,43 @@ logger.info("event=application_starting")
 
 
 # --------------------------------------------------
-# 2. REQUEST LOGGING MIDDLEWARE
+# 2. PROMETHEUS METRICS
+# --------------------------------------------------
+
+HTTP_REQUESTS = Counter(
+    "student_api_http_requests_total",
+    "Total HTTP requests received by the Student Performance API",
+    ["method", "path", "status"],
+)
+
+HTTP_LATENCY = Histogram(
+    "student_api_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"],
+)
+
+PREDICTIONS = Counter(
+    "student_api_predictions_total",
+    "Total prediction attempts",
+    ["result"],
+)
+
+MODEL_LOADED = Gauge(
+    "student_api_model_loaded",
+    "Whether the prediction model is loaded",
+)
+
+MODEL_LOADED.set(0)
+
+
+# --------------------------------------------------
+# 3. REQUEST LOGGING AND METRICS MIDDLEWARE
 # --------------------------------------------------
 
 @app.before_request
 def log_request_start():
     g.request_id = str(uuid.uuid4())
-    g.request_start_time = time.time()
+    g.request_start_time = time.perf_counter()
 
     logger.info(
         "event=request_started request_id=%s method=%s path=%s",
@@ -54,12 +90,26 @@ def log_request_start():
 
 
 @app.after_request
-def log_request_end(response):
+def log_request_end_and_record_metrics(response):
     request_id = getattr(g, "request_id", "unknown")
-    start_time = getattr(g, "request_start_time", time.time())
-    duration_ms = round((time.time() - start_time) * 1000, 2)
+    start_time = getattr(g, "request_start_time", time.perf_counter())
+
+    duration = time.perf_counter() - start_time
+    duration_ms = round(duration * 1000, 2)
 
     response.headers["X-Request-ID"] = request_id
+
+    if request.path != "/metrics":
+        HTTP_REQUESTS.labels(
+            request.method,
+            request.path,
+            str(response.status_code),
+        ).inc()
+
+        HTTP_LATENCY.labels(
+            request.method,
+            request.path,
+        ).observe(duration)
 
     logger.info(
         "event=request_completed request_id=%s "
@@ -75,29 +125,38 @@ def log_request_end(response):
 
 
 # --------------------------------------------------
-# 3. MODEL LOADING
+# 4. MODEL LOADING
 # --------------------------------------------------
 
 def load_model():
     logger.info("event=model_load_started")
 
-    if not MODEL_PATH.exists():
-        logger.error(
-            "event=model_load_failed reason=model_file_missing"
-        )
-        raise FileNotFoundError(
-            "student_performance_model.pkl was not found. "
-            "Run the training pipeline first."
-        )
+    try:
+        if not MODEL_PATH.exists():
+            logger.error(
+                "event=model_load_failed reason=model_file_missing"
+            )
+            MODEL_LOADED.set(0)
 
-    model = joblib.load(MODEL_PATH)
+            raise FileNotFoundError(
+                "student_performance_model.pkl was not found. "
+                "Run the training pipeline first."
+            )
 
-    logger.info("event=model_loaded")
-    return model
+        model = joblib.load(MODEL_PATH)
+
+        MODEL_LOADED.set(1)
+        logger.info("event=model_loaded")
+
+        return model
+
+    except Exception:
+        MODEL_LOADED.set(0)
+        raise
 
 
 # --------------------------------------------------
-# 4. OPENAPI DOCUMENTATION
+# 5. OPENAPI DOCUMENTATION
 # --------------------------------------------------
 
 OPENAPI_SPEC = {
@@ -182,6 +241,17 @@ OPENAPI_SPEC = {
                             }
                         },
                     },
+                },
+            }
+        },
+        "/metrics": {
+            "get": {
+                "summary": "Prometheus monitoring metrics",
+                "tags": ["Monitoring"],
+                "responses": {
+                    "200": {
+                        "description": "Prometheus metrics"
+                    }
                 },
             }
         },
@@ -289,6 +359,7 @@ OPENAPI_SPEC = {
     },
 }
 
+
 SWAGGER_UI_HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -313,7 +384,7 @@ SWAGGER_UI_HTML = """<!DOCTYPE html>
 
 
 # --------------------------------------------------
-# 5. API ROUTES
+# 6. API ROUTES
 # --------------------------------------------------
 
 @app.get("/openapi.json")
@@ -343,7 +414,7 @@ def health_check():
 
 
 # --------------------------------------------------
-# 6. PREDICTION WITH ERROR TRACKING
+# 7. PREDICTION WITH ERROR TRACKING
 # --------------------------------------------------
 
 @app.post("/predict")
@@ -354,11 +425,14 @@ def predict():
         data = request.get_json(silent=True)
 
         if not isinstance(data, dict) or not data:
+            PREDICTIONS.labels(result="error").inc()
+
             logger.warning(
                 "event=prediction_validation_failed "
                 "request_id=%s reason=invalid_or_missing_json",
                 request_id,
             )
+
             return jsonify({
                 "error": "JSON request body is required"
             }), 400
@@ -368,18 +442,21 @@ def predict():
         ]
 
         if missing_fields:
+            PREDICTIONS.labels(result="error").inc()
+
             logger.warning(
                 "event=prediction_validation_failed "
                 "request_id=%s reason=missing_fields fields=%s",
                 request_id,
                 ",".join(missing_fields),
             )
+
             return jsonify({
                 "error": "Missing required fields",
                 "missing_fields": missing_fields,
             }), 400
 
-        # Validate scores without logging the submitted values.
+        # Validate scores without logging submitted values.
         for field in ["reading_score", "writing_score"]:
             value = data[field]
 
@@ -388,12 +465,15 @@ def predict():
                 or not isinstance(value, int)
                 or not 0 <= value <= 100
             ):
+                PREDICTIONS.labels(result="error").inc()
+
                 logger.warning(
                     "event=prediction_validation_failed "
                     "request_id=%s reason=invalid_score field=%s",
                     request_id,
                     field,
                 )
+
                 return jsonify({
                     "error": (
                         f"{field} must be an integer between 0 and 100"
@@ -405,8 +485,11 @@ def predict():
         ])
 
         model = load_model()
+
         prediction_code = int(model.predict(sample)[0])
         prediction = "PASS" if prediction_code == 1 else "FAIL"
+
+        PREDICTIONS.labels(result="success").inc()
 
         logger.info(
             "event=prediction_succeeded request_id=%s result=%s",
@@ -420,10 +503,13 @@ def predict():
         })
 
     except Exception:
+        PREDICTIONS.labels(result="error").inc()
+
         logger.exception(
             "event=prediction_failed request_id=%s",
             request_id,
         )
+
         return jsonify({
             "error": "Prediction failed due to an internal server error",
             "request_id": request_id,
@@ -431,7 +517,7 @@ def predict():
 
 
 # --------------------------------------------------
-# 7. UNEXPECTED SERVER ERROR TRACKING
+# 8. UNEXPECTED SERVER ERROR TRACKING
 # --------------------------------------------------
 
 @app.errorhandler(500)
@@ -450,7 +536,19 @@ def handle_internal_server_error(error):
 
 
 # --------------------------------------------------
-# 8. APPLICATION ENTRY POINT
+# 9. PROMETHEUS METRICS ENDPOINT
+# --------------------------------------------------
+
+@app.get("/metrics")
+def metrics():
+    return Response(
+        generate_latest(),
+        content_type=CONTENT_TYPE_LATEST,
+    )
+
+
+# --------------------------------------------------
+# 10. APPLICATION ENTRY POINT
 # --------------------------------------------------
 
 if __name__ == "__main__":
